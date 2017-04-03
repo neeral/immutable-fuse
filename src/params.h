@@ -27,6 +27,7 @@ struct bb_state {
     FILE *logfile;
     char *rootdir;
     struct journal *journals;
+    struct file_size *file_sizes;
 };
 #define BB_DATA ((struct bb_state *) fuse_get_context()->private_data)
 
@@ -38,6 +39,11 @@ struct journal {
     size_t size;
     off_t offset;
     struct journal *next;
+};
+struct file_size {
+    char *path;  // TODO how to make this immutable?
+    off_t offset;
+    struct file_size *next;
 };
 #define MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
 #define MAX(X, Y) (((X) > (Y)) ? (X) : (Y))

@@ -59,13 +59,26 @@ static void bb_fullpath(char fpath[PATH_MAX], const char *path)
 
 ///////////////////////////////////////////////////////////
 //
-// Prototypes for all these functions, and the C-style comments,
-// come from /usr/include/fuse.h
+// Functions to help with ND's implementation of immutable
+// filesystem.
 //
-
+/** Updates stat.st_size to account for journals.
+ *
+ *  stat.st_size has the size of the original file in rootdir.
+ *  This function updates the size with any modifications to the
+ *  file held in-memory.
+ */
 void update_size(const char *path, size_t *st_size)
 {
     size_t size = *st_size;
+    // see if we have updated the file's size with truncate()
+    struct file_size *fs = BB_DATA->file_sizes;
+    while (fs) {
+        if (! strcmp(fs->path, path)) {  // same file
+            *st_size = fs->offset;
+        }
+        fs = fs->next;
+    }
     struct journal *j = BB_DATA->journals;
     while (j) {
         if (! strcmp(j->path, path)) {  // same file
@@ -73,9 +86,88 @@ void update_size(const char *path, size_t *st_size)
         }
         j = j->next;
     }
-    log_msg("ND modifying st_size from %d to %d\n", size, st_size);
+    log_msg("ND modifying st_size from %d to %d\n", size, *st_size);
 }
 
+void prepend_file_size(const char *path, off_t offset)
+{
+    struct file_size *fs = malloc(sizeof(struct file_size));
+    const int path_size = (1 + strlen(path)) * sizeof(char);
+    fs->path = malloc(path_size);
+    strncpy(fs->path, path, strlen(path));
+    fs->path[strlen(path)] = '\0';
+    fs->offset = offset;
+    fs->next = BB_DATA->file_sizes;
+    BB_DATA->file_sizes = fs;
+}
+
+void free_file_size(struct file_size *fs)
+{
+    free(fs->path);
+    free(fs);
+}
+
+void free_journal(struct journal *j)
+{
+    free(j->path);
+    free(j->buf);
+    free(j);
+}
+
+/** Handles truncation of journals.
+ *
+ *  1. If a journal's offset is after the newsize, then remove the
+ *     journal entry.
+ *  2. If there is overlap between the journal's range and the
+ *     newsize, update the journal's size.
+ *  3. Regardless of 1 or 2, create or update file_size entry.
+ */
+void truncate_journals(const char *path, off_t newsize)
+{
+    struct journal *j = BB_DATA->journals;
+    struct journal *prev = NULL;
+    while (j) {
+        if (! strcmp(j->path, path)) {  // same file
+            if (j->offset > newsize) {  // journal is beyond newsize
+               if (prev) {
+                    prev->next = j->next;
+                } else {  // first element in the linked list
+                    BB_DATA->journals = j->next;
+                }
+                struct journal *to_free = j;
+                j = j->next;
+                free_journal(to_free);
+            } else if (j->offset + j->size > newsize) {  // overlaps
+                j->size = newsize - j->offset;
+                prev = j;
+                j = j->next;
+            } else {
+                prev =j;
+                j = j->next;
+            }
+        }
+    }
+
+    prepend_file_size(path, newsize);
+    struct file_size *fs = BB_DATA->file_sizes->next;
+    while (fs) {
+        if (! strcmp(fs->path, path)) {  // same file
+            fs->offset = newsize;
+            // remove prepended file_size
+            struct file_size *to_free = BB_DATA->file_sizes;
+            BB_DATA->file_sizes = BB_DATA->file_sizes->next;
+            free_file_size(to_free);
+            break;
+        }
+        fs = fs->next;
+    }
+}
+
+///////////////////////////////////////////////////////////
+//
+// Prototypes for all these functions, and the C-style comments,
+// come from /usr/include/fuse.h
+//
 /** Get file attributes.
  *
  * Similar to stat().  The 'st_dev' and 'st_blksize' fields are
@@ -270,13 +362,11 @@ int bb_chown(const char *path, uid_t uid, gid_t gid)
 /** Change the size of a file */
 int bb_truncate(const char *path, off_t newsize)
 {
-    char fpath[PATH_MAX];
-    
     log_msg("\nbb_truncate(path=\"%s\", newsize=%lld)\n",
 	    path, newsize);
-    bb_fullpath(fpath, path);
 
-    return log_syscall("truncate", truncate(fpath, newsize), 0);
+    truncate_journals(path, newsize);
+    return 0;
 }
 
 /** Change the access and/or modification times of a file */
@@ -355,7 +445,7 @@ int bb_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_
     int retstat = log_syscall("pread", pread(fi->fh, newbuf, size, offset), 0);
 
     struct journal *j = BB_DATA->journals;
-    // TODO ND do this calc better: newbuf = min(size, sizeof(buf) + bytes + 1);
+    // TODO (ND) do this calc better: newbuf = min(size, sizeof(buf) + bytes + 1);
     memcpy(buf, newbuf, strlen(newbuf));
     free(newbuf);
     while (j) {
@@ -371,7 +461,8 @@ int bb_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_
         j = j->next;
     }
     // TODO (ND) calculate max bytes read
-    return retstat < 0 ? retstat : strlen(buf) + 1; // TODO add status for journals
+    // TODO (ND) add status for journals
+    return retstat < 0 ? retstat : strlen(buf) + 1;
 }
 
 int append_journal(const char *path, const char *buf, size_t size, off_t offset)
@@ -468,7 +559,7 @@ int bb_statfs(const char *path, struct statvfs *statv)
 // this is a no-op in BBFS.  It just logs the call and returns success
 int bb_flush(const char *path, struct fuse_file_info *fi)
 {
-    log_msg("\nbb_flush(path=\"%s\", fi=0x%08x)\n", path, fi);
+    log_msg("\nbb_flush(path=\"%s\", fi=0x%08x) <no-op>\n", path, fi);
     // no need to get fpath on this one, since I work from fi->fh not the path
     log_fi(fi);
 	
@@ -509,17 +600,11 @@ int bb_release(const char *path, struct fuse_file_info *fi)
  */
 int bb_fsync(const char *path, int datasync, struct fuse_file_info *fi)
 {
-    log_msg("\nbb_fsync(path=\"%s\", datasync=%d, fi=0x%08x)\n",
+    log_msg("\nbb_fsync(path=\"%s\", datasync=%d, fi=0x%08x) <no-op>\n",
 	    path, datasync, fi);
     log_fi(fi);
     
-    // some unix-like systems (notably freebsd) don't have a datasync call
-#ifdef HAVE_FDATASYNC
-    if (datasync)
-	return log_syscall("fdatasync", fdatasync(fi->fh), 0);
-    else
-#endif	
-	return log_syscall("fsync", fsync(fi->fh), 0);
+    return 0;
 }
 
 #ifdef HAVE_SYS_XATTR_H
@@ -813,17 +898,12 @@ int bb_access(const char *path, int mask)
  */
 int bb_ftruncate(const char *path, off_t offset, struct fuse_file_info *fi)
 {
-    int retstat = 0;
-    
     log_msg("\nbb_ftruncate(path=\"%s\", offset=%lld, fi=0x%08x)\n",
 	    path, offset, fi);
     log_fi(fi);
     
-    retstat = ftruncate(fi->fh, offset);
-    if (retstat < 0)
-	retstat = log_error("bb_ftruncate ftruncate");
-    
-    return retstat;
+    truncate_journals(path, offset);
+    return 0;
 }
 
 /**
@@ -858,7 +938,7 @@ int bb_fgetattr(const char *path, struct stat *statbuf, struct fuse_file_info *f
 	retstat = log_error("bb_fgetattr fstat");
     
     log_stat(statbuf);
-    
+
     update_size(path, &(statbuf->st_size));
     return retstat;
 }
@@ -957,6 +1037,7 @@ int main(int argc, char *argv[])
 
     bb_data->logfile = log_open();
     bb_data->journals = NULL;
+    bb_data->file_sizes = NULL;
 
     // turn over control to fuse
     fprintf(stderr, "about to call fuse_main\n");
