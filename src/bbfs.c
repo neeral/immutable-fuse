@@ -35,7 +35,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/types.h>
 
 #ifdef HAVE_SYS_XATTR_H
 #include <sys/xattr.h>
@@ -63,6 +62,20 @@ static void bb_fullpath(char fpath[PATH_MAX], const char *path)
 // Prototypes for all these functions, and the C-style comments,
 // come from /usr/include/fuse.h
 //
+
+void update_size(const char *path, size_t *st_size)
+{
+    size_t size = *st_size;
+    struct journal *j = BB_DATA->journals;
+    while (j) {
+        if (! strcmp(j->path, path)) {  // same file
+            *st_size = MAX(*st_size, j->offset + j->size);
+        }
+        j = j->next;
+    }
+    log_msg("ND modifying st_size from %d to %d\n", size, st_size);
+}
+
 /** Get file attributes.
  *
  * Similar to stat().  The 'st_dev' and 'st_blksize' fields are
@@ -81,6 +94,7 @@ int bb_getattr(const char *path, struct stat *statbuf)
     retstat = log_syscall("lstat", lstat(fpath, statbuf), 0);
     
     log_stat(statbuf);
+    update_size(path, &(statbuf->st_size));
     
     return retstat;
 }
@@ -330,14 +344,50 @@ int bb_open(const char *path, struct fuse_file_info *fi)
 // returned by read.
 int bb_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
 {
-    int retstat = 0;
-    
     log_msg("\nbb_read(path=\"%s\", buf=0x%08x, size=%d, offset=%lld, fi=0x%08x)\n",
 	    path, buf, size, offset, fi);
     // no need to get fpath on this one, since I work from fi->fh not the path
     log_fi(fi);
 
-    return log_syscall("pread", pread(fi->fh, buf, size, offset), 0);
+    memset(buf, '\0', size);
+    char *newbuf = (char *) malloc(size * sizeof(char));
+    memset(newbuf, '\0', size);
+    int retstat = log_syscall("pread", pread(fi->fh, newbuf, size, offset), 0);
+
+    struct journal *j = BB_DATA->journals;
+    // TODO ND do this calc better: newbuf = min(size, sizeof(buf) + bytes + 1);
+    memcpy(buf, newbuf, strlen(newbuf));
+    free(newbuf);
+    while (j) {
+       if (! strcmp(j->path, path)) {  // same file, then starts within chunk requested
+            if (offset <= j->offset && j->offset <= (offset + size)) {
+                int bytes = MIN(
+                    j->size,  // journal fits within chunk requested
+                    size + offset - j->offset
+                );
+                memcpy(buf + (j->offset - offset), j->buf, bytes);
+            }
+        }
+        j = j->next;
+    }
+    // TODO (ND) calculate max bytes read
+    return retstat < 0 ? retstat : strlen(buf) + 1; // TODO add status for journals
+}
+
+int append_journal(const char *path, const char *buf, size_t size, off_t offset)
+{
+    struct journal *j;
+    j = malloc(sizeof(struct journal));
+    int path_size = (1 + strlen(path)) * sizeof(char);
+    j->path = malloc(path_size);
+    memset(j->path, '\0', path_size);
+    strncpy(j->path, path, strlen(path));
+    j->buf = malloc(sizeof(buf));
+    memcpy(j->buf, buf, sizeof(buf));
+    j->size = size;
+    j->offset = offset;
+    j->next = BB_DATA->journals;
+    BB_DATA->journals = j;
 }
 
 /** Write data to an open file
@@ -361,7 +411,11 @@ int bb_write(const char *path, const char *buf, size_t size, off_t offset,
     // no need to get fpath on this one, since I work from fi->fh not the path
     log_fi(fi);
 
-    return log_syscall("pwrite", pwrite(fi->fh, buf, size, offset), 0);
+    int index = strlen(path) - strlen(".swp");
+    if ( strcmp(path+index, ".swp") ) {
+        append_journal(path, buf, size, offset);
+    }
+    return size;
 }
 
 /** Get file system statistics
@@ -805,6 +859,7 @@ int bb_fgetattr(const char *path, struct stat *statbuf, struct fuse_file_info *f
     
     log_stat(statbuf);
     
+    update_size(path, &(statbuf->st_size));
     return retstat;
 }
 
@@ -899,9 +954,10 @@ int main(int argc, char *argv[])
     argv[argc-2] = argv[argc-1];
     argv[argc-1] = NULL;
     argc--;
-    
+
     bb_data->logfile = log_open();
-    
+    bb_data->journals = NULL;
+
     // turn over control to fuse
     fprintf(stderr, "about to call fuse_main\n");
     fuse_stat = fuse_main(argc, argv, &bb_oper, bb_data);
