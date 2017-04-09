@@ -72,7 +72,7 @@ void update_size(const char *path, size_t *st_size)
 {
     size_t size = *st_size;
     // see if we have updated the file's size with truncate()
-    struct file_size *fs = BB_DATA->file_sizes;
+    struct file_s *fs = BB_DATA->files;
     while (fs) {
         if (! strcmp(fs->path, path)) {  // same file
             *st_size = fs->offset;
@@ -89,19 +89,21 @@ void update_size(const char *path, size_t *st_size)
     log_msg("ND modifying st_size from %d to %d\n", size, *st_size);
 }
 
-void prepend_file_size(const char *path, off_t offset)
+void prepend_file_s(const char *path, off_t offset)
 {
-    struct file_size *fs = malloc(sizeof(struct file_size));
+    struct file_s *fs = malloc(sizeof(struct file_s));
     const int path_size = (1 + strlen(path)) * sizeof(char);
     fs->path = malloc(path_size);
     strncpy(fs->path, path, strlen(path));
     fs->path[strlen(path)] = '\0';
     fs->offset = offset;
-    fs->next = BB_DATA->file_sizes;
-    BB_DATA->file_sizes = fs;
+    fs->type = S_IFREG;
+    fs->is_deleted = false;
+    fs->next = BB_DATA->files;
+    BB_DATA->files = fs;
 }
 
-void free_file_size(struct file_size *fs)
+void free_file_s(struct file_s *fs)
 {
     free(fs->path);
     free(fs);
@@ -114,13 +116,60 @@ void free_journal(struct journal *j)
     free(j);
 }
 
+void delete_file_s(const char *path)
+{
+    // update entry if already exists
+    bool found = false;
+    struct file_s *fs = BB_DATA->files;
+    while (fs) {
+        if (! strcmp(fs->path, path)) {  // same file
+            fs->is_deleted = true;
+            found = true;
+            break;
+        }
+        fs = fs->next;
+    }
+    // otherwise, create new entry
+    if (!found) {
+        prepend_file_s(path, 0);
+        BB_DATA->files->is_deleted = true;
+    }
+}
+
+void delete_dir(const char *path) {
+    delete_file_s(path);
+    struct file_s * const head = BB_DATA->files;
+    if (! strcmp(head->path, path)) {
+        head->type = S_IFDIR;
+    }
+}
+
+/** Returns whether $path has been deleted.
+ *
+ *  This is required because unlink and rmdir are mocked
+ *  and do not reach the underlying filesystem. Instead,
+ *  we must check the files state.
+ */
+bool is_deleted(const char *path)
+{
+    log_msg("is_deleted(%s)\n", path);
+    struct file_s *fs = BB_DATA->files;
+    while (fs) {
+        if (! strcmp(fs->path, path)) {  // same file
+            return fs->is_deleted;
+        }
+        fs = fs->next;
+    }
+    return false;
+}
+
 /** Handles truncation of journals.
  *
  *  1. If a journal's offset is after the newsize, then remove the
  *     journal entry.
  *  2. If there is overlap between the journal's range and the
  *     newsize, update the journal's size.
- *  3. Regardless of 1 or 2, create or update file_size entry.
+ *  3. Regardless of 1 or 2, create or update file_s entry.
  */
 void truncate_journals(const char *path, off_t newsize)
 {
@@ -148,15 +197,15 @@ void truncate_journals(const char *path, off_t newsize)
         }
     }
 
-    prepend_file_size(path, newsize);
-    struct file_size *fs = BB_DATA->file_sizes->next;
+    prepend_file_s(path, newsize);
+    struct file_s *fs = BB_DATA->files->next;
     while (fs) {
         if (! strcmp(fs->path, path)) {  // same file
             fs->offset = newsize;
-            // remove prepended file_size
-            struct file_size *to_free = BB_DATA->file_sizes;
-            BB_DATA->file_sizes = BB_DATA->file_sizes->next;
-            free_file_size(to_free);
+            // remove prepended file_s
+            struct file_s *to_free = BB_DATA->files;
+            BB_DATA->files = BB_DATA->files->next;
+            free_file_s(to_free);
             break;
         }
         fs = fs->next;
@@ -271,23 +320,55 @@ int bb_unlink(const char *path)
 {
     char fpath[PATH_MAX];
     
-    log_msg("bb_unlink(path=\"%s\")\n",
+    log_msg("\nbb_unlink(path=\"%s\")\n",
 	    path);
-    bb_fullpath(fpath, path);
 
-    return log_syscall("unlink", unlink(fpath), 0);
+    delete_file_s(path);
+    return 0;
 }
 
 /** Remove a directory */
 int bb_rmdir(const char *path)
 {
     char fpath[PATH_MAX];
+    DIR *dp;
+    struct dirent *de;
     
-    log_msg("bb_rmdir(path=\"%s\")\n",
+    log_msg("\nbb_rmdir(path=\"%s\")\n",
 	    path);
     bb_fullpath(fpath, path);
 
-    return log_syscall("rmdir", rmdir(fpath), 0);
+    dp = opendir(fpath);
+    log_msg("    opendir returned 0x%p\n", dp);
+    if (dp == NULL)
+        return log_error("bb_rmdir opendir");
+
+    de = readdir(dp);
+    log_msg("    readdir returned 0x%p\n", de);
+    if (de == 0) {
+        return log_error("bb_rmdir readdir");
+    }
+
+    do {
+        // ignore . and .. entries which are always present
+        if (!(!strcmp(".", de->d_name) || !strcmp("..", de->d_name))) {
+            const int len = strlen(de->d_name) + strlen(path) + 1;
+            char de_path[len];
+            memset(de_path, '\0', len);
+            strncat(de_path, path, strlen(path));
+            if (strcmp(path, "/")) {       // insert path separator unless rootdir
+                strncat(de_path, "/", 1);
+            }
+            strncat(de_path, de->d_name, strlen(de->d_name));
+            if (!is_deleted(de_path)) {
+                log_msg("    ERROR bb_rmdir: %s exists in directory\n", de->d_name);
+                return -ENOTEMPTY;
+            }
+        }
+    } while ((de = readdir(dp)) != NULL);
+
+    delete_dir(path);
+    return 0;
 }
 
 /** Create a symbolic link */
@@ -445,7 +526,6 @@ int bb_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_
     int retstat = log_syscall("pread", pread(fi->fh, newbuf, size, offset), 0);
 
     struct journal *j = BB_DATA->journals;
-    // TODO (ND) do this calc better: newbuf = min(size, sizeof(buf) + bytes + 1);
     memcpy(buf, newbuf, strlen(newbuf));
     free(newbuf);
     while (j) {
@@ -460,8 +540,7 @@ int bb_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_
         }
         j = j->next;
     }
-    // TODO (ND) calculate max bytes read
-    // TODO (ND) add status for journals
+    // TODO (ND) calculate bytes read for non-text files
     return retstat < 0 ? retstat : strlen(buf) + 1;
 }
 
@@ -737,6 +816,10 @@ int bb_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset
     // once again, no need for fullpath -- but note that I need to cast fi->fh
     dp = (DIR *) (uintptr_t) fi->fh;
 
+    if (is_deleted(path)) {
+        return -ENOENT;
+    }
+
     // Every directory contains at least two entries: . and ..  If my
     // first call to the system readdir() returns NULL I've got an
     // error; near as I can tell, that's the only condition under
@@ -754,7 +837,16 @@ int bb_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset
     // read the whole directory; the second means the buffer is full.
     do {
 	log_msg("calling filler with name %s\n", de->d_name);
-	if (filler(buf, de->d_name, NULL, 0) != 0) {
+    const int len = strlen(de->d_name) + strlen(path) + 1;
+    char de_path[len];
+    memset(de_path, '\0', len);
+    strncat(de_path, path, strlen(path));
+    if (strcmp(path, "/")) {       // insert path separator unless rootdir
+        strncat(de_path, "/", 1);
+    }
+    strncat(de_path, de->d_name, strlen(de->d_name));
+    if (!is_deleted(de_path) &&
+	    filler(buf, de->d_name, NULL, 0) != 0) {
 	    log_msg("    ERROR bb_readdir filler:  buffer full");
 	    return -ENOMEM;
 	}
@@ -1037,7 +1129,7 @@ int main(int argc, char *argv[])
 
     bb_data->logfile = log_open();
     bb_data->journals = NULL;
-    bb_data->file_sizes = NULL;
+    bb_data->files = NULL;
 
     // turn over control to fuse
     fprintf(stderr, "about to call fuse_main\n");

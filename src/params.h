@@ -27,12 +27,13 @@ struct bb_state {
     FILE *logfile;
     char *rootdir;
     struct journal *journals;
-    struct file_size *file_sizes;
+    struct file_s *files;
 };
 #define BB_DATA ((struct bb_state *) fuse_get_context()->private_data)
 
 // [ND] changes below
 #include <sys/types.h>
+#include <stdbool.h>
 struct journal {
     char *path;  // TODO how to make this immutable?
     char *buf;
@@ -40,10 +41,13 @@ struct journal {
     off_t offset;
     struct journal *next;
 };
-struct file_size {
+struct file_s {
     char *path;  // TODO how to make this immutable?
     off_t offset;
-    struct file_size *next;
+    // 0: directory, 1: regular file
+    unsigned int type;
+    bool is_deleted;
+    struct file_s *next;
 };
 #define MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
 #define MAX(X, Y) (((X) > (Y)) ? (X) : (Y))
