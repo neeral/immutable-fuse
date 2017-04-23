@@ -1,8 +1,15 @@
 /*
-  Copyright (C) 2012 Joseph J. Pfeiffer, Jr., Ph.D. <pfeiffer@cs.nmsu.edu>
+  Copyright (C) 2017 Neeral Dodhia <neeral@github.com>
 
   This program can be distributed under the terms of the GNU GPLv3.
   See the file COPYING.
+
+  There are a couple of structs and some imports defined below, beginning
+  after
+  > // [ND] changes below
+  This file is based on work by Joseph J. Pfeiffer, Jr., Ph.D.
+
+  Copyright (C) 2012 Joseph J. Pfeiffer, Jr., Ph.D. <pfeiffer@cs.nmsu.edu>
 
   There are a couple of symbols that need to be #defined before
   #including all the headers.
