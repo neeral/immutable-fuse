@@ -42,3 +42,5 @@ Creating new files and directories, renaming, changing owner, changing
 privileges, creating links, etc are not supported. By this, I mean that
 they are destructive operations that will modify `rootdir`.
 
+# How to build, run and test
+Instructions from the original tutorial are available [here](html/running.html)
